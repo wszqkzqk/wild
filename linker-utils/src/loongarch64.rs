@@ -16,6 +16,15 @@ use crate::utils::or_from_slice;
 use crate::utils::u32_from_slice;
 use crate::utils::u64_from_slice;
 
+/// B26 branch range: signed 27-bit byte displacement (4-byte aligned).
+pub const B26_RANGE: std::ops::RangeInclusive<i64> = -(1i64 << 27)..=((1i64 << 27) - 1);
+
+#[inline]
+#[must_use]
+pub fn distance_fits_b26(distance: i64) -> bool {
+    B26_RANGE.contains(&distance) && distance % 4 == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelaxationKind {
     /// Leave the instruction alone. Used when we only want to change the kind of relocation used.
@@ -23,6 +32,12 @@ pub enum RelaxationKind {
 
     /// Replace with nop
     ReplaceWithNop,
+
+    /// Rewrite pcaddu18i + jirl ($ra) into bl.
+    Call36ToBl,
+
+    /// Rewrite pcaddu18i + jirl ($zero) into b.
+    Call36ToB,
 }
 
 impl RelaxationKind {
@@ -35,12 +50,23 @@ impl RelaxationKind {
                     0x03, 0x40, 0x0, 0x0, // nop
                 ]);
             }
+            RelaxationKind::Call36ToBl => {
+                section_bytes[offset..offset + 4].copy_from_slice(&0x5400_0000u32.to_le_bytes());
+            }
+            RelaxationKind::Call36ToB => {
+                section_bytes[offset..offset + 4].copy_from_slice(&0x5000_0000u32.to_le_bytes());
+            }
         }
     }
 
     #[must_use]
     pub fn next_modifier(&self) -> RelocationModifier {
-        RelocationModifier::Normal
+        match self {
+            RelaxationKind::Call36ToBl | RelaxationKind::Call36ToB => {
+                RelocationModifier::SkipNextRelocation
+            }
+            _ => RelocationModifier::Normal,
+        }
     }
 }
 

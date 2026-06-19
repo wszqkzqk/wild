@@ -1,8 +1,12 @@
 use crate::elf::Elf;
 use crate::elf::PLT_ENTRY_SIZE;
+use crate::elf::RelocationList;
 use crate::error;
 use crate::error::Result;
 use crate::platform::Platform;
+use crate::platform::RelaxSymbolInfo;
+use crate::platform::Relocation;
+use crate::platform::RelocationSequence;
 use itertools::AllEqualValueError;
 use itertools::Itertools;
 use linker_utils::elf::DynamicRelocationKind;
@@ -12,8 +16,12 @@ use linker_utils::elf::RelocationKindInfo;
 use linker_utils::elf::SIZE_2KB;
 use linker_utils::elf::loongarch64_rel_type_to_string;
 use linker_utils::elf::shf;
+use linker_utils::loongarch64::B26_RANGE;
 use linker_utils::loongarch64::RelaxationKind;
+use linker_utils::loongarch64::distance_fits_b26;
+use linker_utils::loongarch64::relocation_type_from_raw;
 use linker_utils::relaxation::RelocationModifier;
+use linker_utils::relaxation::SectionRelaxDeltas;
 use linker_utils::utils::or_from_slice;
 
 pub(crate) struct ElfLoongArch64;
@@ -28,6 +36,12 @@ const PLT_ENTRY_TEMPLATE: &[u8] = &[
 const _ASSERTS: () = {
     assert!(PLT_ENTRY_TEMPLATE.len() as u64 == PLT_ENTRY_SIZE);
 };
+
+macro_rules! rel_info_from_type {
+    ($r_type:expr) => {
+        const { relocation_type_from_raw($r_type).unwrap() }
+    };
+}
 
 impl crate::platform::Arch for ElfLoongArch64 {
     type Relaxation = Relaxation;
@@ -129,10 +143,24 @@ impl crate::platform::Arch for ElfLoongArch64 {
             return None;
         }
 
-        let offset = offset_in_section as usize;
-
         match relocation_kind {
             object::elf::R_LARCH_CALL36 if !interposable => {
+                if let Some(rd) = jirl_rd_at(section_bytes, offset_in_section)
+                    && (rd == 0 || rd == 1)
+                {
+                    let kind = if rd == 0 {
+                        RelaxationKind::Call36ToB
+                    } else {
+                        RelaxationKind::Call36ToBl
+                    };
+                    let mut b26_info = rel_info_from_type!(object::elf::R_LARCH_B26);
+                    b26_info.kind = RelocationKind::Relative;
+                    return Some(Relaxation {
+                        kind,
+                        rel_info: b26_info,
+                        mandatory: false,
+                    });
+                }
                 relocation.kind = RelocationKind::Relative;
                 return Some(Relaxation {
                     kind: RelaxationKind::NoOp,
@@ -156,6 +184,35 @@ impl crate::platform::Arch for ElfLoongArch64 {
         None
     }
 
+    fn supports_size_reduction_relaxations() -> bool {
+        true
+    }
+
+    fn collect_relaxation_deltas(
+        section_output_address: u64,
+        section_bytes: &[u8],
+        relocations: RelocationList,
+        existing_deltas: Option<&SectionRelaxDeltas>,
+        mut resolve_symbol: impl FnMut(object::SymbolIndex) -> Option<RelaxSymbolInfo>,
+    ) -> (Vec<(u64, u32)>, Option<u64>) {
+        match relocations {
+            RelocationList::Rela(rela_list) => collect_relaxation_deltas(
+                section_output_address,
+                section_bytes,
+                rela_list.rel_iter(),
+                existing_deltas,
+                &mut resolve_symbol,
+            ),
+            RelocationList::Crel(crel_iter) => collect_relaxation_deltas(
+                section_output_address,
+                section_bytes,
+                crel_iter.flatten(),
+                existing_deltas,
+                &mut resolve_symbol,
+            ),
+        }
+    }
+
     fn get_source_info<'data>(
         object: &<Self::Platform as Platform>::File<'data>,
         relocations: &<Self::Platform as Platform>::RelocationSections,
@@ -169,6 +226,69 @@ impl crate::platform::Arch for ElfLoongArch64 {
             offset_in_section,
         )
     }
+}
+
+/// Returns the `rd` field of a `jirl` instruction at `offset` if it looks like a `jirl`.
+fn jirl_rd_at(section_bytes: &[u8], offset: u64) -> Option<u32> {
+    let off = offset as usize;
+    if off + 4 > section_bytes.len() {
+        return None;
+    }
+    let word = u32::from_le_bytes(section_bytes[off..off + 4].try_into().unwrap());
+    if (word >> 26) & 0x3f != 0x13 {
+        return None;
+    }
+    Some(word & 0x1f)
+}
+
+/// Scan relocations for CALL36 relaxation candidates.
+fn collect_relaxation_deltas<R: Relocation>(
+    section_output_address: u64,
+    section_bytes: &[u8],
+    relocations: impl Iterator<Item = R>,
+    existing_deltas: Option<&SectionRelaxDeltas>,
+    mut resolve_symbol: impl FnMut(object::SymbolIndex) -> Option<RelaxSymbolInfo>,
+) -> (Vec<(u64, u32)>, Option<u64>) {
+    let mut raw_deltas = Vec::new();
+    let mut min_unrelaxed_margin: Option<u64> = None;
+    let mut prev_call36: Option<(u64, object::SymbolIndex)> = None;
+
+    for rel in relocations {
+        match rel.raw_type() {
+            object::elf::R_LARCH_CALL36 => {
+                prev_call36 = rel.symbol().map(|sym_idx| (rel.offset(), sym_idx));
+            }
+            object::elf::R_LARCH_RELAX => {
+                if let Some((call_offset, sym_idx)) = prev_call36
+                    && rel.offset() == call_offset
+                    && !existing_deltas.is_some_and(|d| d.has_delta_at(call_offset))
+                    && let Some(info) = resolve_symbol(sym_idx)
+                    && !info.is_interposable
+                {
+                    let distance = (info.output_address as i64 + rel.addend())
+                        - (section_output_address + call_offset) as i64;
+                    if distance_fits_b26(distance) {
+                        if let Some(rd) = jirl_rd_at(section_bytes, call_offset + 4)
+                            && (rd == 0 || rd == 1)
+                        {
+                            raw_deltas.push((call_offset, 4));
+                        }
+                    } else {
+                        let b26_max = B26_RANGE.end().unsigned_abs();
+                        let margin = distance.unsigned_abs() - b26_max;
+                        min_unrelaxed_margin =
+                            Some(min_unrelaxed_margin.map_or(margin, |m| m.min(margin)));
+                    }
+                }
+                prev_call36 = None;
+            }
+            _ => {
+                prev_call36 = None;
+            }
+        }
+    }
+
+    (raw_deltas, min_unrelaxed_margin)
 }
 
 #[derive(Debug, Clone)]
